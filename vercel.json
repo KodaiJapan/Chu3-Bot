@@ -11,5 +11,11 @@
       "src": "/(.*)",
       "dest": "dist/index.js"
     }
+  ],
+  "crons": [
+    {
+      "path": "/api/cron/poll-notion",
+      "schedule": "*/5 * * * *"
+    }
   ]
 }
