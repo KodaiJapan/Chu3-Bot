@@ -13,11 +13,11 @@ import { load } from "ts-dotenv";
 const env = load({
   CHANNEL_ACCESS_TOKEN: String,
   CHANNEL_SECRET: String,
-  PORT: Number,
+  PORT: { type: Number, optional: true },
 });
 
-// ポートを設定
-const PORT = env.PORT || 3000;
+// ポートを設定（Vercel では .env が無く PORT 省略可）
+const PORT = env.PORT ?? 3000;
 
 // チャネルアクセストークンとチャネルシークレットのconfigインスタンスを作成
 const config = {
@@ -99,7 +99,11 @@ app.post(
   }
 );
 
-// サーバー起動
-app.listen(PORT, () => {
-  console.log(`http://localhost:${PORT}/`);
-});
+// ローカルのみ HTTP サーバー起動（Vercel は serverless で export を使う）
+if (!process.env.VERCEL) {
+  app.listen(PORT, () => {
+    console.log(`http://localhost:${PORT}/`);
+  });
+}
+
+export default app;
