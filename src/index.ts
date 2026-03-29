@@ -16,7 +16,11 @@ import express, {
   type Response,
 } from "express";
 import { load } from "ts-dotenv";
-import { buildTaskListMessages, wantsTaskList } from "./task-list.js";
+import {
+  buildTaskListMessages,
+  normalizeLineUserText,
+  wantsTaskList,
+} from "./task-list.js";
 
 // 環境変数をロード
 const env = load({
@@ -368,6 +372,10 @@ app.get("/api/diag", (req: Request, res: Response): void => {
     ],
     fallbackPolling:
       "Webhook が難しい場合は GET /api/cron/poll-notion（CRON_SECRET または PUSH_TEST_SECRET）で定期ポーリング",
+    lineWebhookPostUrl: host ? `${proto}://${host}/webhook` : "",
+    taskListTriggers: env.TASK_LIST_TRIGGERS,
+    taskListHint:
+      "LINE で「タスク一覧」「タスク」「一覧」「リスト」のいずれかを含めて送信。グループは @メンション付きでも可。",
   });
 });
 
@@ -596,9 +604,12 @@ const textEventHandler = async (
 
   const { replyToken } = event;
 
-  const { text } = event.message;
+  const rawText = event.message.text;
+  const text = normalizeLineUserText(rawText);
+  const taskIntent = wantsTaskList(text, env.TASK_LIST_TRIGGERS);
+  console.error("[line] text:", JSON.stringify(text), "taskIntent:", taskIntent);
 
-  if (wantsTaskList(text, env.TASK_LIST_TRIGGERS)) {
+  if (taskIntent) {
     try {
       const body = await queryNotionTaskListForLine();
       const chunks = buildTaskListMessages(body);

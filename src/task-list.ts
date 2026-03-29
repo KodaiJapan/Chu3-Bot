@@ -4,9 +4,17 @@
 
 const LINE_TEXT_MAX = 4500;
 
+/** グループで「@ボット名 タスク一覧」のように送られる前提で先頭の @〜 を除く */
+export function normalizeLineUserText(text: string): string {
+  return text
+    .replace(/^@\S+\s*/u, "")
+    .replace(/^\u200b+/, "")
+    .trim();
+}
+
 /** トリガー文字列（カンマ区切り）に一致するか */
 export function wantsTaskList(userText: string, triggersCsv: string): boolean {
-  const t = userText.trim();
+  const t = normalizeLineUserText(userText);
   if (!t) return false;
   const triggers = triggersCsv
     .split(",")
