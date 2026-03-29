@@ -1,0 +1,105 @@
+import {
+  middleware,
+  messagingApi,
+  type MiddlewareConfig,
+  type WebhookEvent,
+  type TextMessage,
+  type MessageAPIResponseBase,
+} from "@line/bot-sdk";
+import express, { type Application, type Request, type Response } from "express";
+import { load } from "ts-dotenv";
+
+// 環境変数をロード
+const env = load({
+  CHANNEL_ACCESS_TOKEN: String,
+  CHANNEL_SECRET: String,
+  PORT: Number,
+});
+
+// ポートを設定
+const PORT = env.PORT || 3000;
+
+// チャネルアクセストークンとチャネルシークレットのconfigインスタンスを作成
+const config = {
+  channelAccessToken: env.CHANNEL_ACCESS_TOKEN || "",
+  channelSecret: env.CHANNEL_SECRET || "",
+};
+// ミドルウェアのconfigとして設定
+const middlewareConfig: MiddlewareConfig = config;
+
+// LINE Messaging APIクライアントを作成。これが応答役になる。
+const client = new messagingApi.MessagingApiClient({
+  channelAccessToken: env.CHANNEL_ACCESS_TOKEN || "",
+});
+
+// Expressアプリケーションを作成
+const app: Application = express();
+
+// ルートを設定
+app.get("/", async (_: Request, res: Response): Promise<Response> => {
+  return res.status(200).send({
+    message: "success",
+  });
+});
+
+// テキストメッセージを処理するハンドラー（関数）　
+//下で使う用。
+const textEventHandler = async (
+  event: WebhookEvent
+): Promise<MessageAPIResponseBase | undefined> => {
+  if (event.type !== "message" || event.message.type !== "text") {
+    return;
+  }
+
+  const { replyToken } = event;
+
+  const { text } = event.message;
+
+  const resText = (() => {
+    switch (Math.floor(Math.random() * 3)) {
+      case 0:
+        return text.split("").reverse().join("");
+      case 1:
+        return text.split("").join(" ");
+      default:
+        return text.split("").reverse().join(" ");
+    }
+  })();
+  console.log(resText);
+
+  const response: TextMessage = {
+    type: "text",
+    text: resText,
+  };
+  await client.replyMessage({
+    replyToken: replyToken,
+    messages: [response],
+  });
+};
+
+// webhookエンドポイントにpostリクエストが来たら、
+app.post(
+  "/webhook",
+  middleware(middlewareConfig),
+  async (req: Request, res: Response): Promise<Response> => {
+    const events: WebhookEvent[] = req.body.events;
+    await Promise.all(
+      events.map(async (event: WebhookEvent) => {
+        try {
+          await textEventHandler(event);
+        } catch (err: unknown) {
+          if (err instanceof Error) {
+            console.error(err);
+          }
+          return res.status(500);
+        }
+      })
+    );
+    return res.status(200);
+  }
+);
+
+// サーバー起動
+app.listen(PORT, () => {
+  console.log(`http://localhost:${PORT}/`);
+});
