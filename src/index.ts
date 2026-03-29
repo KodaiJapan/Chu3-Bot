@@ -1,4 +1,5 @@
 import {
+  HTTPError,
   middleware,
   messagingApi,
   type MiddlewareConfig,
@@ -21,6 +22,8 @@ const env = load({
   LINE_GROUP_ID: { type: String, optional: true },
   /** 監視する DB（省略時は下の定数） */
   NOTION_DATABASE_ID: { type: String, optional: true },
+  /** true なら DB 一致チェックを省略（単一 DB のワークスペース向け・検証用） */
+  NOTION_RELAX_DATABASE_FILTER: { type: Boolean, optional: true },
   PORT: { type: Number, optional: true },
 });
 
@@ -53,6 +56,48 @@ function isEventForTargetDatabase(body: unknown, targetId: string): boolean {
   const normalized = targetId.replace(/-/g, "");
   const s = JSON.stringify(body);
   return s.includes(normalized) || s.includes(targetId);
+}
+
+const normalizedDatabaseId = databaseId.replace(/-/g, "");
+
+/** ページが監視対象 DB に属するか（Webhook に DB ID が無いケース用） */
+async function pageBelongsToTargetDatabase(pageId: string): Promise<boolean> {
+  const r = await fetch(`https://api.notion.com/v1/pages/${pageId}`, {
+    headers: {
+      Authorization: `Bearer ${env.NOTION_API_KEY}`,
+      "Notion-Version": "2022-06-28",
+    },
+  });
+  if (!r.ok) {
+    console.error("[notion-webhook] retrieve page failed", r.status, await r.text());
+    return false;
+  }
+  const page = (await r.json()) as {
+    parent?: { type?: string; database_id?: string };
+  };
+  if (page.parent?.type !== "database_id" || !page.parent.database_id) {
+    return false;
+  }
+  return (
+    page.parent.database_id.replace(/-/g, "") === normalizedDatabaseId
+  );
+}
+
+/** ペイロードまたはページ取得で、監視対象 DB の変更か判定 */
+async function eventConcernsTargetDatabase(body: unknown): Promise<boolean> {
+  if (isEventForTargetDatabase(body, databaseId)) return true;
+  const obj = body as {
+    entity?: { id?: string; type?: string };
+    data?: { entity?: { id?: string; type?: string } };
+  };
+  const entity = obj.entity ?? obj.data?.entity;
+  if (entity?.type === "database" && entity.id) {
+    return entity.id.replace(/-/g, "") === normalizedDatabaseId;
+  }
+  if (entity?.type === "page" && entity.id) {
+    return pageBelongsToTargetDatabase(entity.id);
+  }
+  return false;
 }
 
 /** Notion Webhook の X-Notion-Signature を検証（生ボディ文字列で HMAC） */
@@ -172,8 +217,14 @@ app.post(
     if (!eventType || !NOTIFY_EVENT_TYPES.has(eventType)) {
       return res.status(200).send("ignored");
     }
-    if (!isEventForTargetDatabase(parsed, databaseId)) {
-      return res.status(200).send("not target db");
+    if (!env.NOTION_RELAX_DATABASE_FILTER) {
+      const okDb = await eventConcernsTargetDatabase(parsed);
+      if (!okDb) {
+        console.error(
+          "[notion-webhook] not target db (payload に DB ID が無い場合はページ取得で照合済み)。NOTION_RELAX_DATABASE_FILTER=true で緩和可"
+        );
+        return res.status(200).send("not target db");
+      }
     }
 
     const groupId = env.LINE_GROUP_ID;
@@ -192,7 +243,16 @@ app.post(
         messages: [msg],
       });
     } catch (e: unknown) {
-      console.error("[notion-webhook] LINE push failed", e);
+      if (e instanceof HTTPError) {
+        console.error(
+          "[notion-webhook] LINE push failed",
+          e.statusCode,
+          e.statusMessage,
+          e.originalError
+        );
+      } else {
+        console.error("[notion-webhook] LINE push failed", e);
+      }
       return res.status(500).send("line push failed");
     }
     return res.status(200).send("ok");
