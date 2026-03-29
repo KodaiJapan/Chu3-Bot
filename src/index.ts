@@ -85,6 +85,9 @@ app.post(
     const events: WebhookEvent[] = req.body.events;
     await Promise.all(
       events.map(async (event: WebhookEvent) => {
+        if (event.source.type === "group") {
+          console.log("LINE groupId:", event.source.groupId);
+        }
         try {
           await textEventHandler(event);
         } catch (err: unknown) {
