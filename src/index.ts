@@ -102,43 +102,82 @@ async function eventConcernsTargetDatabase(body: unknown): Promise<boolean> {
   if (entity?.type === "page" && entity.id) {
     return pageBelongsToTargetDatabase(entity.id);
   }
+  /** API 2025-09-03: entity が data_source。ペイロードに DB ID が無い場合は文字列マッチに頼る */
+  if (entity?.type === "data_source" && entity.id) {
+    return isEventForTargetDatabase(body, databaseId);
+  }
   return false;
 }
 
-/** Notion Webhook の X-Notion-Signature を検証（生ボディ文字列で HMAC） */
+/**
+ * Notion Webhook の X-Notion-Signature を検証。
+ * 公式サンプルは JSON.parse 後の JSON.stringify と raw の両方があり得るため両方試す。
+ */
 function verifyNotionSignature(
   rawBody: string,
   signatureHeader: string | undefined,
   secret: string
 ): boolean {
   if (!signatureHeader?.startsWith("sha256=")) return false;
-  const expectedHex = createHmac("sha256", secret)
-    .update(rawBody, "utf8")
-    .digest("hex");
   const receivedHex = signatureHeader.slice("sha256=".length);
-  if (expectedHex.length !== receivedHex.length) return false;
+
+  const payloads: string[] = [rawBody];
   try {
-    return timingSafeEqual(
-      Buffer.from(expectedHex, "hex"),
-      Buffer.from(receivedHex, "hex")
-    );
+    payloads.push(JSON.stringify(JSON.parse(rawBody)));
   } catch {
-    return false;
+    /* raw のみ */
   }
+
+  for (const payload of payloads) {
+    const expectedHex = createHmac("sha256", secret)
+      .update(payload, "utf8")
+      .digest("hex");
+    if (expectedHex.length !== receivedHex.length) continue;
+    try {
+      if (
+        timingSafeEqual(
+          Buffer.from(expectedHex, "hex"),
+          Buffer.from(receivedHex, "hex")
+        )
+      ) {
+        return true;
+      }
+    } catch {
+      /* 長さ不一致など */
+    }
+  }
+  return false;
 }
 
 const NOTIFY_EVENT_TYPES = new Set([
-  // 従来（Notion-Version 2022-06-28 系）
   "database.content_updated",
   "database.schema_updated",
-  // 2025-09-03 以降のデータソース単位イベント
+  "database.created",
+  "database.deleted",
+  "database.moved",
+  "database.undeleted",
   "data_source.content_updated",
   "data_source.schema_updated",
+  "data_source.created",
+  "data_source.deleted",
+  "data_source.moved",
+  "data_source.undeleted",
   "page.properties_updated",
   "page.content_updated",
   "page.created",
   "page.deleted",
+  "page.moved",
+  "page.undeleted",
+  "page.locked",
+  "page.unlocked",
 ]);
+
+/** DB 行のプロパティ変更などは page.* / 新APIは data_source.* が来る。将来追加にも対応 */
+function isNotifiableNotionEventType(eventType: string): boolean {
+  if (!eventType) return false;
+  if (NOTIFY_EVENT_TYPES.has(eventType)) return true;
+  return /^(page|database|data_source)\./u.test(eventType);
+}
 
 /** Notion Database Query のレスポンス JSON を取得する */
 async function queryNotionDatabase(): Promise<unknown> {
@@ -266,9 +305,10 @@ app.post(
     }
 
     const eventType = typeof obj.type === "string" ? obj.type : "";
-    if (!eventType || !NOTIFY_EVENT_TYPES.has(eventType)) {
+    console.error("[notion-webhook] incoming type:", eventType || "(empty)");
+    if (!eventType || !isNotifiableNotionEventType(eventType)) {
       console.error(
-        "[notion-webhook] ignored (unknown type). Add to NOTIFY_EVENT_TYPES if needed:",
+        "[notion-webhook] ignored (unknown type):",
         eventType || "(empty)"
       );
       return res.status(200).send("ignored");
