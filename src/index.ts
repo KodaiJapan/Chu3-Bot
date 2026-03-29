@@ -22,8 +22,13 @@ const env = load({
   LINE_GROUP_ID: { type: String, optional: true },
   /** 監視する DB（省略時は下の定数） */
   NOTION_DATABASE_ID: { type: String, optional: true },
-  /** true なら DB 一致チェックを省略（単一 DB のワークスペース向け・検証用） */
-  NOTION_RELAX_DATABASE_FILTER: { type: Boolean, optional: true },
+  /**
+   * true: DB が一致するか見ない（同一ワークスペースのイベントなら通知）
+   * false: 監視中 NOTION_DATABASE_ID のみ。デフォルト true で「届かない」を防ぐ
+   */
+  NOTION_RELAX_DATABASE_FILTER: { type: Boolean, default: true },
+  /** 設定時のみ POST /api/test-push でグループプッシュを試せる（Bearer と同じ値） */
+  PUSH_TEST_SECRET: { type: String, optional: true },
   PORT: { type: Number, optional: true },
 });
 
@@ -123,8 +128,12 @@ function verifyNotionSignature(
 }
 
 const NOTIFY_EVENT_TYPES = new Set([
+  // 従来（Notion-Version 2022-06-28 系）
   "database.content_updated",
   "database.schema_updated",
+  // 2025-09-03 以降のデータソース単位イベント
+  "data_source.content_updated",
+  "data_source.schema_updated",
   "page.properties_updated",
   "page.content_updated",
   "page.created",
@@ -160,6 +169,49 @@ app.get("/", async (_: Request, res: Response): Promise<Response> => {
     message: "success",
   });
 });
+
+/**
+ * LINE グループへのプッシュが単体で動くか確認（Notion 不要）
+ * curl -X POST https://(host)/api/test-push -H "Authorization: Bearer $PUSH_TEST_SECRET"
+ */
+app.post(
+  "/api/test-push",
+  async (req: Request, res: Response): Promise<Response> => {
+    const secret = env.PUSH_TEST_SECRET;
+    if (!secret) {
+      return res.status(404).send("Not found");
+    }
+    const auth = req.headers.authorization;
+    if (auth !== `Bearer ${secret}`) {
+      return res.status(401).send("Unauthorized");
+    }
+    const gid = env.LINE_GROUP_ID?.trim();
+    if (!gid) {
+      return res.status(500).json({ error: "LINE_GROUP_ID is not set" });
+    }
+    try {
+      await client.pushMessage({
+        to: gid,
+        messages: [
+          {
+            type: "text",
+            text: "テスト: グループへのプッシュは成功しています（Notion とは無関係）",
+          },
+        ],
+      });
+      return res.status(200).json({ ok: true });
+    } catch (e: unknown) {
+      if (e instanceof HTTPError) {
+        return res.status(500).json({
+          error: "LINE push failed",
+          statusCode: e.statusCode,
+          body: e.originalError,
+        });
+      }
+      throw e;
+    }
+  }
+);
 
 // Notion から DB 一覧ページを取得（ブラウザや curl で確認用）
 app.get("/notion-db", async (_: Request, res: Response): Promise<Response> => {
@@ -215,6 +267,10 @@ app.post(
 
     const eventType = typeof obj.type === "string" ? obj.type : "";
     if (!eventType || !NOTIFY_EVENT_TYPES.has(eventType)) {
+      console.error(
+        "[notion-webhook] ignored (unknown type). Add to NOTIFY_EVENT_TYPES if needed:",
+        eventType || "(empty)"
+      );
       return res.status(200).send("ignored");
     }
     if (!env.NOTION_RELAX_DATABASE_FILTER) {
@@ -227,7 +283,7 @@ app.post(
       }
     }
 
-    const groupId = env.LINE_GROUP_ID;
+    const groupId = env.LINE_GROUP_ID?.trim();
     if (!groupId) {
       console.warn(
         "[notion-webhook] LINE_GROUP_ID 未設定のため LINE 通知をスキップ"
