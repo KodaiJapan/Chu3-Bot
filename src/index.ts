@@ -8,7 +8,12 @@ import {
   type MessageAPIResponseBase,
 } from "@line/bot-sdk";
 import { createHmac, timingSafeEqual } from "node:crypto";
-import express, { type Application, type Request, type Response } from "express";
+import express, {
+  type Application,
+  type NextFunction,
+  type Request,
+  type Response,
+} from "express";
 import { load } from "ts-dotenv";
 
 // 環境変数をロード
@@ -29,6 +34,10 @@ const env = load({
   NOTION_RELAX_DATABASE_FILTER: { type: Boolean, default: true },
   /** 設定時のみ POST /api/test-push でグループプッシュを試せる（Bearer と同じ値） */
   PUSH_TEST_SECRET: { type: String, optional: true },
+  /**
+   * true のとき Notion の署名検証をスキップ（署名不一致で 401 になる場合の切り分け用。本番では false）
+   */
+  NOTION_SKIP_SIGNATURE_VERIFY: { type: Boolean, optional: true },
   PORT: { type: Number, optional: true },
 });
 
@@ -252,6 +261,35 @@ app.post(
   }
 );
 
+/** ブラウザで開いて「URL が Vercel に届くか」確認用。Notion への登録は POST のこの URL */
+app.get("/notion-webhook", (_req: Request, res: Response): void => {
+  res.status(200).json({
+    ok: true,
+    message:
+      "この URL は生きています。Notion Integration の Webhook には「POST 先」として同じパスを登録してください（GET は検証用のみ）。",
+  });
+});
+
+/** 設定状況（秘密は出さない）と Notion に貼るべき URL */
+app.get("/api/diag", (req: Request, res: Response): void => {
+  const proto = (req.headers["x-forwarded-proto"] as string) || "https";
+  const host = req.headers.host || "";
+  const notionWebhookUrl = host ? `${proto}://${host}/notion-webhook` : "";
+  res.status(200).json({
+    ok: true,
+    notionWebhookPostUrl: notionWebhookUrl,
+    hasLineGroupId: Boolean(env.LINE_GROUP_ID?.trim()),
+    hasNotionApiKey: Boolean(env.NOTION_API_KEY),
+    hasNotionVerificationToken: Boolean(env.NOTION_VERIFICATION_TOKEN),
+    notionRelaxDatabaseFilter: env.NOTION_RELAX_DATABASE_FILTER,
+    checkNotionIntegration: [
+      "developers.notion.com の Integration → Webhooks で上記 URL を登録",
+      "対象データベースを Integration に Connect",
+      "購読イベントに page.properties_updated と data_source.content_updated を含める",
+    ],
+  });
+});
+
 // Notion から DB 一覧ページを取得（ブラウザや curl で確認用）
 app.get("/notion-db", async (_: Request, res: Response): Promise<Response> => {
   try {
@@ -269,10 +307,24 @@ app.get("/notion-db", async (_: Request, res: Response): Promise<Response> => {
  */
 app.post(
   "/notion-webhook",
-  express.raw({ type: "application/json" }),
+  (req: Request, _res: Response, next: NextFunction) => {
+    console.error(
+      "[notion-webhook] POST hit content-type:",
+      req.headers["content-type"] ?? "(none)"
+    );
+    next();
+  },
+  // charset 付き application/json 等でも必ず raw を取る（空ボディで署名失敗するのを防ぐ）
+  express.raw({ type: "*/*", limit: "2mb" }),
   async (req: Request, res: Response): Promise<Response> => {
     const rawBody =
       Buffer.isBuffer(req.body) ? req.body.toString("utf8") : String(req.body ?? "");
+    if (!rawBody.trim()) {
+      console.error(
+        "[notion-webhook] empty body — Content-Type またはプロキシ設定を確認してください"
+      );
+      return res.status(400).send("empty body");
+    }
     const sigRaw = req.headers["x-notion-signature"];
     const sig = Array.isArray(sigRaw) ? sigRaw[0] : sigRaw;
 
@@ -293,15 +345,23 @@ app.post(
     }
 
     const secret = env.NOTION_VERIFICATION_TOKEN;
-    if (secret) {
+    if (secret && !env.NOTION_SKIP_SIGNATURE_VERIFY) {
       if (!verifyNotionSignature(rawBody, sig, secret)) {
-        console.error("[notion-webhook] signature mismatch");
+        console.error(
+          "[notion-webhook] signature mismatch — token 不一致の可能性。切り分け: NOTION_SKIP_SIGNATURE_VERIFY=true または token を再取得"
+        );
         return res.status(401).send("invalid signature");
       }
     } else {
-      console.warn(
-        "[notion-webhook] NOTION_VERIFICATION_TOKEN 未設定のため署名検証をスキップしています（本番では必ず設定してください）"
-      );
+      if (env.NOTION_SKIP_SIGNATURE_VERIFY) {
+        console.warn(
+          "[notion-webhook] NOTION_SKIP_SIGNATURE_VERIFY により署名検証をスキップしています"
+        );
+      } else if (!secret) {
+        console.warn(
+          "[notion-webhook] NOTION_VERIFICATION_TOKEN 未設定のため署名検証をスキップしています（本番では必ず設定してください）"
+        );
+      }
     }
 
     const eventType = typeof obj.type === "string" ? obj.type : "";
