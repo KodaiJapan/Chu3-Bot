@@ -16,6 +16,7 @@ import express, {
   type Response,
 } from "express";
 import { load } from "ts-dotenv";
+import { buildTaskListMessages, wantsTaskList } from "./task-list.js";
 
 // 環境変数をロード
 const env = load({
@@ -41,6 +42,11 @@ const env = load({
   NOTION_SKIP_SIGNATURE_VERIFY: { type: Boolean, optional: true },
   /** GET /api/cron/poll-notion の認証（未設定なら PUSH_TEST_SECRET を流用） */
   CRON_SECRET: { type: String, optional: true },
+  /** タスク一覧を出すときのキーワード（カンマ区切り） */
+  TASK_LIST_TRIGGERS: {
+    type: String,
+    default: "タスク一覧,タスク,一覧,リスト",
+  },
   PORT: { type: Number, optional: true },
 });
 
@@ -203,6 +209,32 @@ async function queryNotionDatabase(): Promise<unknown> {
         "Content-Type": "application/json",
       },
       body: JSON.stringify({}),
+    }
+  );
+  const body: unknown = await r.json();
+  if (!r.ok) {
+    throw new Error(
+      `Notion API ${r.status}: ${JSON.stringify(body)}`
+    );
+  }
+  return body;
+}
+
+/** LINE 用: 直近の行だけ取得（更新順） */
+async function queryNotionTaskListForLine(): Promise<unknown> {
+  const r = await fetch(
+    `https://api.notion.com/v1/databases/${databaseId}/query`,
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${env.NOTION_API_KEY}`,
+        "Notion-Version": "2022-06-28",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        page_size: 30,
+        sorts: [{ timestamp: "last_edited_time", direction: "descending" }],
+      }),
     }
   );
   const body: unknown = await r.json();
@@ -565,6 +597,40 @@ const textEventHandler = async (
   const { replyToken } = event;
 
   const { text } = event.message;
+
+  if (wantsTaskList(text, env.TASK_LIST_TRIGGERS)) {
+    try {
+      const body = await queryNotionTaskListForLine();
+      const chunks = buildTaskListMessages(body);
+      const slice = chunks.slice(0, 5);
+      const messages: TextMessage[] = slice.map((t) => ({
+        type: "text",
+        text: t,
+      }));
+      if (chunks.length > 5) {
+        messages.push({
+          type: "text",
+          text:
+            "...他 " +
+            String(chunks.length - 5) +
+            " 件分は長いため省略しました。Notion で全件を確認してください。",
+        });
+      }
+      await client.replyMessage({ replyToken, messages });
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e);
+      await client.replyMessage({
+        replyToken,
+        messages: [
+          {
+            type: "text",
+            text: `タスク一覧の取得に失敗しました。\n${msg.slice(0, 500)}`,
+          },
+        ],
+      });
+    }
+    return;
+  }
 
   const resText = (() => {
     switch (Math.floor(Math.random() * 3)) {
