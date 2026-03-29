@@ -196,6 +196,8 @@ async function queryNotionTaskListForLine() {
 }
 /** Webhook が届かないとき用: DB 全行の id + last_edited_time をハッシュして変化を検知 */
 const NOTION_POLL_STATE_FILE = "/tmp/jukubot-notion-poll.json";
+/** Notion 初回 Webhook 検証で届く token をサーバー上に保存（GET で再取得用。サーバレスでは同一インスタンス時のみ有効） */
+const NOTION_VERIFICATION_STATE_FILE = "/tmp/notion-verification-last.json";
 async function queryDatabaseFingerprint() {
     const rows = [];
     let cursor;
@@ -304,7 +306,31 @@ app.get("/api/diag", (req, res) => {
         lineWebhookPostUrl: host ? `${proto}://${host}/webhook` : "",
         taskListTriggers: env.TASK_LIST_TRIGGERS,
         taskListHint: "LINE で「タスク一覧」「タスク」「一覧」「リスト」のいずれかを含めて送信。グループは @メンション付きでも可。",
+        lastVerificationToken: "初回検証後は GET /api/notion-verification-token（Bearer CRON_SECRET または PUSH_TEST_SECRET）で直近の verification_token を取得できます（Vercel ではログが確実）",
     });
+});
+/**
+ * Notion 初回検証でサーバーが保存した verification_token を取得（Bearer 必須）
+ */
+app.get("/api/notion-verification-token", async (req, res) => {
+    const secret = env.CRON_SECRET || env.PUSH_TEST_SECRET;
+    if (!secret) {
+        return res.status(503).json({
+            error: "CRON_SECRET または PUSH_TEST_SECRET を Vercel に設定してください",
+        });
+    }
+    if (req.headers.authorization !== `Bearer ${secret}`) {
+        return res.status(401).send("Unauthorized");
+    }
+    try {
+        const raw = await readFile(NOTION_VERIFICATION_STATE_FILE, "utf8");
+        return res.status(200).json(JSON.parse(raw));
+    }
+    catch {
+        return res.status(404).json({
+            message: "まだ verification_token を保存していません。Notion で Webhook を保存して初回 POST を受け取ってください。",
+        });
+    }
 });
 /**
  * Webhook なしで Notion DB の変化を検知（Vercel Cron または手動 curl）
@@ -414,8 +440,22 @@ express.raw({ type: "*/*", limit: "2mb" }), async (req, res) => {
     const obj = parsed;
     // 購読作成時のワンタイム検証（イベントには type がある）
     if (typeof obj.verification_token === "string" && !("type" in obj)) {
-        console.warn("[notion-webhook] verification_token を受信しました。Notion の Webhook 画面で Verify に貼り付け、同じ値を NOTION_VERIFICATION_TOKEN に設定してください。");
-        return res.status(200).json({ ok: true });
+        const token = obj.verification_token;
+        console.error("[notion-webhook] verification_token（この値を Notion の入力欄と NOTION_VERIFICATION_TOKEN に貼る）:", token);
+        try {
+            await writeFile(NOTION_VERIFICATION_STATE_FILE, JSON.stringify({
+                verification_token: token,
+                receivedAt: new Date().toISOString(),
+            }, null, 2), "utf8");
+        }
+        catch (e) {
+            console.error("[notion-webhook] failed to save verification state", e);
+        }
+        return res.status(200).json({
+            ok: true,
+            verification_token: token,
+            message: "この verification_token を Notion の入力欄に貼り、検証してください。Vercel の NOTION_VERIFICATION_TOKEN にも同じ値を設定してください。",
+        });
     }
     const secret = env.NOTION_VERIFICATION_TOKEN;
     if (secret && !env.NOTION_SKIP_SIGNATURE_VERIFY) {
