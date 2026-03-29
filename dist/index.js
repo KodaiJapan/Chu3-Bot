@@ -60,6 +60,9 @@ const textEventHandler = async (event) => {
 app.post("/webhook", middleware(middlewareConfig), async (req, res) => {
     const events = req.body.events;
     await Promise.all(events.map(async (event) => {
+        if (event.source.type === "group") {
+            console.log("LINE groupId:", event.source.groupId);
+        }
         try {
             await textEventHandler(event);
         }
