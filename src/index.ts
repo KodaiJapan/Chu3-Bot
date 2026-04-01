@@ -38,13 +38,11 @@ const env = load({
    * false: 監視中 NOTION_DATABASE_ID のみ。デフォルト true で「届かない」を防ぐ
    */
   NOTION_RELAX_DATABASE_FILTER: { type: Boolean, default: true },
-  /** 設定時のみ POST /api/test-push でグループプッシュを試せる（Bearer と同じ値） */
-  PUSH_TEST_SECRET: { type: String, optional: true },
   /**
    * true のとき Notion の署名検証をスキップ（署名不一致で 401 になる場合の切り分け用。本番では false）
    */
   NOTION_SKIP_SIGNATURE_VERIFY: { type: Boolean, optional: true },
-  /** GET /api/cron/poll-notion の認証（未設定なら PUSH_TEST_SECRET を流用） */
+  /** GET /api/cron/poll-notion の認証 */
   CRON_SECRET: { type: String, optional: true },
   /** タスク一覧を出すときのキーワード（カンマ区切り） */
   TASK_LIST_TRIGGERS: {
@@ -201,27 +199,88 @@ function isNotifiableNotionEventType(eventType: string): boolean {
   return /^(page|database|data_source)\./u.test(eventType);
 }
 
-/** Notion Database Query のレスポンス JSON を取得する */
-async function queryNotionDatabase(): Promise<unknown> {
-  const r = await fetch(
-    `https://api.notion.com/v1/databases/${databaseId}/query`,
-    {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${env.NOTION_API_KEY}`,
-        "Notion-Version": "2022-06-28",
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({}),
+function eventTypeToJaLabel(eventType: string): string {
+  if (eventType.endsWith(".created")) return "新規作成";
+  if (eventType.endsWith(".deleted")) return "削除";
+  if (eventType.endsWith(".undeleted")) return "復元";
+  if (eventType.endsWith(".moved")) return "移動";
+  if (eventType.endsWith(".schema_updated")) return "スキーマ変更";
+  if (eventType.endsWith(".properties_updated")) return "プロパティ更新";
+  if (eventType.endsWith(".content_updated")) return "内容更新";
+  if (eventType.endsWith(".locked")) return "ロック";
+  if (eventType.endsWith(".unlocked")) return "ロック解除";
+  return "更新";
+}
+
+type NotionPageProperty = {
+  type?: string;
+  title?: { plain_text?: string }[];
+  status?: { name?: string | null } | null;
+  select?: { name?: string | null } | null;
+  date?: { start?: string | null; end?: string | null } | null;
+  people?: { name?: string | null }[];
+};
+
+type NotionPageLike = {
+  id?: string;
+  url?: string;
+  properties?: Record<string, NotionPageProperty>;
+};
+
+function firstTitleFromProperties(
+  properties: Record<string, NotionPageProperty> | undefined
+): string | undefined {
+  if (!properties) return undefined;
+  for (const v of Object.values(properties)) {
+    if (v?.type === "title" && Array.isArray(v.title)) {
+      const joined = v.title.map((t) => t.plain_text ?? "").join("").trim();
+      if (joined) return joined;
     }
-  );
-  const body: unknown = await r.json();
-  if (!r.ok) {
-    throw new Error(
-      `Notion API ${r.status}: ${JSON.stringify(body)}`
-    );
   }
-  return body;
+  return undefined;
+}
+
+function pickEntityPage(body: Record<string, unknown>): NotionPageLike | undefined {
+  const candidate = body.entity as NotionPageLike | undefined;
+  if (candidate?.properties) return candidate;
+  const nested = (body.data as { entity?: NotionPageLike } | undefined)?.entity;
+  if (nested?.properties) return nested;
+  return undefined;
+}
+
+function buildNotionNotificationText(
+  eventType: string,
+  body: Record<string, unknown>
+): string {
+  const lines: string[] = [];
+  const label = eventTypeToJaLabel(eventType);
+  lines.push(`Notionタスク ${label}`);
+  lines.push(`種類: ${eventType || "不明"}`);
+
+  const page = pickEntityPage(body);
+  const props = page?.properties;
+  const title =
+    firstTitleFromProperties(props) ??
+    ((props?.["タスク名"]?.title ?? [])
+      .map((t) => t.plain_text ?? "")
+      .join("")
+      .trim() || undefined);
+  const status = props?.["ステータス"]?.status?.name ?? undefined;
+  const priority = props?.["優先度"]?.select?.name ?? undefined;
+  const due = props?.["期日"]?.date?.start ?? undefined;
+  const assigneesRaw = props?.["担当者"]?.people ?? [];
+  const assignees = assigneesRaw
+    .map((p) => p.name?.trim())
+    .filter((n): n is string => Boolean(n));
+
+  if (title) lines.push(`タスク: ${title}`);
+  if (status) lines.push(`ステータス: ${status}`);
+  if (priority) lines.push(`優先度: ${priority}`);
+  if (due) lines.push(`期日: ${due}`);
+  if (assignees.length > 0) lines.push(`担当者: ${assignees.join("、")}`);
+  if (page?.url) lines.push(`URL: ${page.url}`);
+
+  return lines.join("\n");
 }
 
 /** LINE 用: 直近の行だけ取得（更新順） */
@@ -304,49 +363,6 @@ app.get("/", async (_: Request, res: Response): Promise<Response> => {
   });
 });
 
-/**
- * LINE グループへのプッシュが単体で動くか確認（Notion 不要）
- * curl -X POST https://(host)/api/test-push -H "Authorization: Bearer $PUSH_TEST_SECRET"
- */
-app.post(
-  "/api/test-push",
-  async (req: Request, res: Response): Promise<Response> => {
-    const secret = env.PUSH_TEST_SECRET;
-    if (!secret) {
-      return res.status(404).send("Not found");
-    }
-    const auth = req.headers.authorization;
-    if (auth !== `Bearer ${secret}`) {
-      return res.status(401).send("Unauthorized");
-    }
-    const gid = env.LINE_GROUP_ID?.trim();
-    if (!gid) {
-      return res.status(500).json({ error: "LINE_GROUP_ID is not set" });
-    }
-    try {
-      await client.pushMessage({
-        to: gid,
-        messages: [
-          {
-            type: "text",
-            text: "テスト: グループへのプッシュは成功しています（Notion とは無関係）",
-          },
-        ],
-      });
-      return res.status(200).json({ ok: true });
-    } catch (e: unknown) {
-      if (e instanceof HTTPError) {
-        return res.status(500).json({
-          error: "LINE push failed",
-          statusCode: e.statusCode,
-          body: e.originalError,
-        });
-      }
-      throw e;
-    }
-  }
-);
-
 /** ブラウザで開いて「URL が Vercel に届くか」確認用。Notion への登録は POST のこの URL */
 app.get("/notion-webhook", (_req: Request, res: Response): void => {
   res.status(200).json({
@@ -373,14 +389,13 @@ app.get("/api/diag", (req: Request, res: Response): void => {
       "対象データベースを Integration に Connect",
       "購読イベントに page.properties_updated と data_source.content_updated を含める",
     ],
-    fallbackPolling:
-      "Webhook が難しい場合は GET /api/cron/poll-notion（CRON_SECRET または PUSH_TEST_SECRET）で定期ポーリング",
+    fallbackPolling: "Webhook が難しい場合は GET /api/cron/poll-notion（Bearer CRON_SECRET）で定期ポーリング",
     lineWebhookPostUrl: host ? `${proto}://${host}/webhook` : "",
     taskListTriggers: env.TASK_LIST_TRIGGERS,
     taskListHint:
       "LINE で「タスク一覧」「タスク」「一覧」「リスト」のいずれかを含めて送信。グループは @メンション付きでも可。",
     lastVerificationToken:
-      "初回検証後は GET /api/notion-verification-token（Bearer CRON_SECRET または PUSH_TEST_SECRET）で直近の verification_token を取得できます（Vercel ではログが確実）",
+      "初回検証後は GET /api/notion-verification-token（Bearer CRON_SECRET）で直近の verification_token を取得できます（Vercel ではログが確実）",
   });
 });
 
@@ -390,11 +405,10 @@ app.get("/api/diag", (req: Request, res: Response): void => {
 app.get(
   "/api/notion-verification-token",
   async (req: Request, res: Response): Promise<Response> => {
-    const secret = env.CRON_SECRET || env.PUSH_TEST_SECRET;
+    const secret = env.CRON_SECRET;
     if (!secret) {
       return res.status(503).json({
-        error:
-          "CRON_SECRET または PUSH_TEST_SECRET を Vercel に設定してください",
+        error: "CRON_SECRET を Vercel に設定してください",
       });
     }
     if (req.headers.authorization !== `Bearer ${secret}`) {
@@ -419,11 +433,10 @@ app.get(
 app.get(
   "/api/cron/poll-notion",
   async (req: Request, res: Response): Promise<Response> => {
-    const secret = env.CRON_SECRET || env.PUSH_TEST_SECRET;
+    const secret = env.CRON_SECRET;
     if (!secret) {
       return res.status(503).json({
-        error:
-          "CRON_SECRET または PUSH_TEST_SECRET を Vercel に設定してください",
+        error: "CRON_SECRET を Vercel に設定してください",
       });
     }
     const auth = req.headers.authorization;
@@ -499,17 +512,6 @@ app.get(
     return res.status(200).json({ ok: true, changed: true, notified: true });
   }
 );
-
-// Notion から DB 一覧ページを取得（ブラウザや curl で確認用）
-app.get("/notion-db", async (_: Request, res: Response): Promise<Response> => {
-  try {
-    const body = await queryNotionDatabase();
-    return res.status(200).json(body);
-  } catch (e: unknown) {
-    const msg = e instanceof Error ? e.message : String(e);
-    return res.status(500).send(msg);
-  }
-});
 
 /**
  * Notion → この URL を Integration の Webhook に登録（HTTPS・公開 URL 必須）
@@ -624,7 +626,7 @@ app.post(
       return res.status(200).send("no LINE_GROUP_ID");
     }
 
-    const text = `Notion: データベースに変更がありました\n種類: ${eventType || "不明"}`;
+    const text = buildNotionNotificationText(eventType, obj);
     const msg: TextMessage = { type: "text", text };
     try {
       await client.pushMessage({
@@ -699,50 +701,31 @@ const textEventHandler = async (
     return;
   }
 
-  const resText = (() => {
-    switch (Math.floor(Math.random() * 3)) {
-      case 0:
-        return text.split("").reverse().join("");
-      case 1:
-        return text.split("").join(" ");
-      default:
-        return text.split("").reverse().join(" ");
-    }
-  })();
-  console.log(resText);
-
-  const response: TextMessage = {
-    type: "text",
-    text: resText,
-  };
-  await client.replyMessage({
-    replyToken: replyToken,
-    messages: [response],
-  });
+  return undefined;
 };
 
 // webhookエンドポイントにpostリクエストが来たら、
 app.post(
   "/webhook",
   middleware(middlewareConfig),
-  async (req: Request, res: Response): Promise<Response> => {
-    const events: WebhookEvent[] = req.body.events;
+  async (req: Request, res: Response): Promise<void> => {
+    const events: WebhookEvent[] = req.body.events ?? [];
+    let hasError = false;
     await Promise.all(
       events.map(async (event: WebhookEvent) => {
-        if (event.source.type === "group") {
-          console.log("LINE groupId:", event.source.groupId);
-        }
         try {
           await textEventHandler(event);
         } catch (err: unknown) {
-          if (err instanceof Error) {
-            console.error(err);
-          }
-          return res.status(500);
+          hasError = true;
+          console.error(err instanceof Error ? err.message : err);
         }
       })
     );
-    return res.status(200);
+    if (hasError) {
+      res.status(500).send("Internal Server Error");
+    } else {
+      res.status(200).send("OK");
+    }
   }
 );
 
