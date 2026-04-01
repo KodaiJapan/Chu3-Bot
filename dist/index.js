@@ -197,12 +197,41 @@ function pickEntityPage(body) {
         return nested;
     return undefined;
 }
-function buildNotionNotificationText(eventType, body) {
+function pickEntityPageId(body) {
+    const candidate = body.entity;
+    if (candidate?.type === "page" && candidate.id)
+        return candidate.id;
+    const nested = body.data
+        ?.entity;
+    if (nested?.type === "page" && nested.id)
+        return nested.id;
+    return undefined;
+}
+async function fetchNotionPageById(pageId) {
+    const r = await fetch(`https://api.notion.com/v1/pages/${pageId}`, {
+        headers: {
+            Authorization: `Bearer ${env.NOTION_API_KEY}`,
+            "Notion-Version": "2022-06-28",
+        },
+    });
+    if (!r.ok) {
+        console.error("[notion-webhook] fetch page detail failed", r.status, pageId);
+        return undefined;
+    }
+    return (await r.json());
+}
+async function buildNotionNotificationText(eventType, body) {
     const lines = [];
     const label = eventTypeToJaLabel(eventType);
     lines.push(`Notionタスク ${label}`);
     lines.push(`種類: ${eventType || "不明"}`);
-    const page = pickEntityPage(body);
+    let page = pickEntityPage(body);
+    if (!page?.properties) {
+        const pageId = pickEntityPageId(body);
+        if (pageId) {
+            page = await fetchNotionPageById(pageId);
+        }
+    }
     const props = page?.properties;
     const title = firstTitleFromProperties(props) ??
         ((props?.["タスク名"]?.title ?? [])
@@ -495,7 +524,7 @@ express.raw({ type: "*/*", limit: "2mb" }), async (req, res) => {
         console.warn("[notion-webhook] LINE_GROUP_ID 未設定のため LINE 通知をスキップ");
         return res.status(200).send("no LINE_GROUP_ID");
     }
-    const text = buildNotionNotificationText(eventType, obj);
+    const text = await buildNotionNotificationText(eventType, obj);
     const msg = { type: "text", text };
     try {
         await client.pushMessage({
