@@ -1,5 +1,5 @@
 import { HTTPError, middleware, messagingApi, } from "@line/bot-sdk";
-import { createHash, createHmac, timingSafeEqual } from "node:crypto";
+import { createHmac, timingSafeEqual } from "node:crypto";
 import { readFile, writeFile } from "node:fs/promises";
 import express, {} from "express";
 import { load } from "ts-dotenv";
@@ -24,7 +24,7 @@ const env = load({
      * true のとき Notion の署名検証をスキップ（署名不一致で 401 になる場合の切り分け用。本番では false）
      */
     NOTION_SKIP_SIGNATURE_VERIFY: { type: Boolean, optional: true },
-    /** GET /api/cron/poll-notion の認証 */
+    /** 管理用エンドポイントの認証 */
     CRON_SECRET: { type: String, optional: true },
     /** タスク一覧を出すときのキーワード（カンマ区切り） */
     TASK_LIST_TRIGGERS: {
@@ -279,44 +279,8 @@ async function queryNotionTaskListForLine() {
     }
     return body;
 }
-/** Webhook が届かないとき用: DB 全行の id + last_edited_time をハッシュして変化を検知 */
-const NOTION_POLL_STATE_FILE = "/tmp/jukubot-notion-poll.json";
 /** Notion 初回 Webhook 検証で届く token をサーバー上に保存（GET で再取得用。サーバレスでは同一インスタンス時のみ有効） */
 const NOTION_VERIFICATION_STATE_FILE = "/tmp/notion-verification-last.json";
-async function queryDatabaseFingerprint() {
-    const rows = [];
-    let cursor;
-    const maxPages = 25;
-    for (let p = 0; p < maxPages; p++) {
-        const r = await fetch(`https://api.notion.com/v1/databases/${databaseId}/query`, {
-            method: "POST",
-            headers: {
-                Authorization: `Bearer ${env.NOTION_API_KEY}`,
-                "Notion-Version": "2022-06-28",
-                "Content-Type": "application/json",
-            },
-            body: JSON.stringify({
-                page_size: 100,
-                ...(cursor ? { start_cursor: cursor } : {}),
-            }),
-        });
-        const body = (await r.json());
-        if (!r.ok) {
-            throw new Error(`Notion query ${r.status}: ${JSON.stringify(body)}`);
-        }
-        for (const page of body.results ?? []) {
-            const o = page;
-            if (o.id && o.last_edited_time) {
-                rows.push({ id: o.id, last_edited_time: o.last_edited_time });
-            }
-        }
-        if (!body.has_more || !body.next_cursor)
-            break;
-        cursor = body.next_cursor ?? undefined;
-    }
-    rows.sort((a, b) => a.id.localeCompare(b.id));
-    return createHash("sha256").update(JSON.stringify(rows)).digest("hex");
-}
 // ルートを設定
 app.get("/", async (_, res) => {
     return res.status(200).send({
@@ -347,7 +311,6 @@ app.get("/api/diag", (req, res) => {
             "対象データベースを Integration に Connect",
             "購読イベントに page.properties_updated と data_source.content_updated を含める",
         ],
-        fallbackPolling: "Webhook が難しい場合は GET /api/cron/poll-notion（Bearer CRON_SECRET）で定期ポーリング",
         lineWebhookPostUrl: host ? `${proto}://${host}/webhook` : "",
         taskListTriggers: env.TASK_LIST_TRIGGERS,
         taskListHint: "LINE で「タスク一覧」「タスク」「一覧」「リスト」のいずれかを含めて送信。グループは @メンション付きでも可。",
@@ -376,76 +339,6 @@ app.get("/api/notion-verification-token", async (req, res) => {
             message: "まだ verification_token を保存していません。Notion で Webhook を保存して初回 POST を受け取ってください。",
         });
     }
-});
-/**
- * Webhook なしで Notion DB の変化を検知（Vercel Cron または手動 curl）
- * 初回実行はベースライン保存のみで LINE は送らない。2 回目以降で差分があれば通知。
- */
-app.get("/api/cron/poll-notion", async (req, res) => {
-    const secret = env.CRON_SECRET;
-    if (!secret) {
-        return res.status(503).json({
-            error: "CRON_SECRET を Vercel に設定してください",
-        });
-    }
-    const auth = req.headers.authorization;
-    if (auth !== `Bearer ${secret}`) {
-        return res.status(401).send("Unauthorized");
-    }
-    const gid = env.LINE_GROUP_ID?.trim();
-    if (!gid) {
-        return res.status(500).json({ error: "LINE_GROUP_ID is not set" });
-    }
-    let fp;
-    try {
-        fp = await queryDatabaseFingerprint();
-    }
-    catch (e) {
-        const msg = e instanceof Error ? e.message : String(e);
-        return res.status(500).json({ error: msg });
-    }
-    let previous;
-    try {
-        const raw = await readFile(NOTION_POLL_STATE_FILE, "utf8");
-        previous = JSON.parse(raw).fingerprint;
-    }
-    catch {
-        /* 初回 */
-    }
-    if (previous === undefined) {
-        await writeFile(NOTION_POLL_STATE_FILE, JSON.stringify({ fingerprint: fp }), "utf8");
-        return res.status(200).json({
-            ok: true,
-            baseline: true,
-            message: "初回: 状態を保存しました。次の実行から変更時に LINE 通知します。",
-        });
-    }
-    if (fp === previous) {
-        return res.status(200).json({ ok: true, changed: false });
-    }
-    await writeFile(NOTION_POLL_STATE_FILE, JSON.stringify({ fingerprint: fp }), "utf8");
-    try {
-        await client.pushMessage({
-            to: gid,
-            messages: [
-                {
-                    type: "text",
-                    text: "Notion: データベースに変更が検出されました（定期チェック）",
-                },
-            ],
-        });
-    }
-    catch (e) {
-        if (e instanceof HTTPError) {
-            return res.status(500).json({
-                error: "LINE push failed",
-                statusCode: e.statusCode,
-                body: e.originalError,
-            });
-        }
-        throw e;
-    }
-    return res.status(200).json({ ok: true, changed: true, notified: true });
 });
 /**
  * Notion → この URL を Integration の Webhook に登録（HTTPS・公開 URL 必須）
