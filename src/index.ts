@@ -52,6 +52,8 @@ const env = load({
   PORT: { type: Number, optional: true },
 });
 
+
+
 // ポートを設定（Vercel では .env が無く PORT 省略可）
 const PORT = env.PORT ?? 3000;
 
