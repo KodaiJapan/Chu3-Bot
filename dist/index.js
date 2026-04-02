@@ -4,6 +4,7 @@ import { readFile, writeFile } from "node:fs/promises";
 import express, {} from "express";
 import { load } from "ts-dotenv";
 import { buildTaskListMessages, normalizeLineUserText, wantsTaskList, } from "./task-list.js";
+import { LAST_THURSDAY_REMINDER_TEXT, MONTH_END_REMINDER_TEXT, getHourInTokyo, isLastDayOfMonthInTokyo, isLastThursdayOfMonthInTokyo, } from "./month-end-reminder.js";
 // 環境変数をロード
 const env = load({
     CHANNEL_ACCESS_TOKEN: String,
@@ -315,8 +316,120 @@ app.get("/api/diag", (req, res) => {
         taskListTriggers: env.TASK_LIST_TRIGGERS,
         taskListHint: "LINE で「タスク一覧」「タスク」「一覧」「リスト」のいずれかを含めて送信。グループは @メンション付きでも可。",
         lastVerificationToken: "初回検証後は GET /api/notion-verification-token（Bearer CRON_SECRET）で直近の verification_token を取得できます（Vercel ではログが確実）",
+        scheduledLineReminders: "Vercel Cron: 毎日 12:00 UTC (= 21:00 JST) に GET /api/cron/daily-line（または従来の /api/cron/month-end-reminder）が呼ばれます。東京時間で 21 時台のとき、(1) 月末最終日なら勤怠リマインダー、(2) その月の最終木曜ならミーティング・中掃除リマインダーを送ります。両方該当する日は2通送ります。?dryRun=1 で送信せず状態だけ確認できます。",
     });
 });
+/**
+ * 日次: 月末勤怠リマインダー + 最終木曜リマインダー（Vercel Cron は 1 本にまとめる想定）
+ */
+async function handleDailyLineCron(req, res) {
+    const secret = env.CRON_SECRET;
+    if (!secret) {
+        return res.status(503).json({
+            error: "CRON_SECRET を環境変数に設定してください",
+        });
+    }
+    if (req.headers.authorization !== `Bearer ${secret}`) {
+        return res.status(401).send("Unauthorized");
+    }
+    const now = new Date();
+    const dryRun = req.query.dryRun === "1" || req.query.dryRun === "true";
+    const lastDay = isLastDayOfMonthInTokyo(now);
+    const lastThu = isLastThursdayOfMonthInTokyo(now);
+    const hour = getHourInTokyo(now);
+    const in21 = hour === 21;
+    if (Number.isNaN(hour)) {
+        return res.status(500).json({ error: "failed to read hour in Asia/Tokyo" });
+    }
+    const wantMonthEnd = lastDay && in21;
+    const wantLastThu = lastThu && in21;
+    if (dryRun) {
+        return res.status(200).json({
+            ok: true,
+            dryRun: true,
+            tokyo: {
+                hour,
+                isLastDayOfMonth: lastDay,
+                isLastThursdayOfMonth: lastThu,
+                wouldSendMonthEnd: wantMonthEnd,
+                wouldSendLastThursday: wantLastThu,
+            },
+        });
+    }
+    if (!in21) {
+        return res.status(200).json({
+            ok: true,
+            skipped: true,
+            reason: "not 21:00 in Asia/Tokyo",
+            tokyo: {
+                hour,
+                isLastDayOfMonth: lastDay,
+                isLastThursdayOfMonth: lastThu,
+            },
+        });
+    }
+    if (!wantMonthEnd && !wantLastThu) {
+        return res.status(200).json({
+            ok: true,
+            skipped: true,
+            reason: "no reminder for today (Asia/Tokyo)",
+            tokyo: {
+                hour,
+                isLastDayOfMonth: lastDay,
+                isLastThursdayOfMonth: lastThu,
+            },
+        });
+    }
+    const gid = env.LINE_GROUP_ID?.trim();
+    if (!gid) {
+        return res.status(500).json({ error: "LINE_GROUP_ID is not set" });
+    }
+    const results = {
+        monthEnd: { sent: false },
+        lastThursday: { sent: false },
+    };
+    if (wantMonthEnd) {
+        try {
+            await client.pushMessage({
+                to: gid,
+                messages: [{ type: "text", text: MONTH_END_REMINDER_TEXT }],
+            });
+            results.monthEnd.sent = true;
+        }
+        catch (e) {
+            if (e instanceof HTTPError) {
+                results.monthEnd.error = `LINE ${e.statusCode}`;
+            }
+            else {
+                results.monthEnd.error = e instanceof Error ? e.message : String(e);
+            }
+        }
+    }
+    if (wantLastThu) {
+        try {
+            await client.pushMessage({
+                to: gid,
+                messages: [{ type: "text", text: LAST_THURSDAY_REMINDER_TEXT }],
+            });
+            results.lastThursday.sent = true;
+        }
+        catch (e) {
+            if (e instanceof HTTPError) {
+                results.lastThursday.error = `LINE ${e.statusCode}`;
+            }
+            else {
+                results.lastThursday.error = e instanceof Error ? e.message : String(e);
+            }
+        }
+    }
+    const anyErr = results.monthEnd.error || results.lastThursday.error;
+    if (anyErr && !results.monthEnd.sent && !results.lastThursday.sent) {
+        return res.status(500).json({ ok: false, results });
+    }
+    return res.status(200).json({ ok: true, results });
+}
+app.get("/api/cron/daily-line", handleDailyLineCron);
+app.get("/api/cron/month-end-reminder", handleDailyLineCron);
 /**
  * Notion 初回検証でサーバーが保存した verification_token を取得（Bearer 必須）
  */

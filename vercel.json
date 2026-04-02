@@ -14,8 +14,8 @@
   ],
   "crons": [
     {
-      "path": "/api/cron/poll-notion",
-      "schedule": "*/5 * * * *"
+      "path": "/api/cron/daily-line",
+      "schedule": "0 12 * * *"
     }
   ]
 }
